@@ -1,0 +1,47 @@
+#version 450
+
+/// DIRECT-mode compute shader.
+///
+/// Reads the raw cell data from a persistent SSBO (written by Lua thread)
+/// and copies it to the render-visible SSBO, respecting per-row dirty flags.
+/// This enables the task-shader culling optimisation path.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint cols;   // grid width
+    uint rows;   // grid height
+} pc;
+
+/// Source: persistently mapped, written by Lua.
+layout(std430, set = 0, binding = 0) readonly buffer SrcCells {
+    uint src_cells[];
+};
+
+/// Per-row dirty flags (1 = needs update, 0 = clean).
+layout(std430, set = 0, binding = 1) buffer DirtyFlags {
+    uint dirty[];
+};
+
+/// Destination: read by the fragment shader.
+layout(std430, set = 0, binding = 2) writeonly buffer DstCells {
+    uint dst_cells[];
+};
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    // Only copy dirty rows.
+    if (dirty[row] == 0u) return;
+
+    uint base = row * pc.cols * 3u;
+    uint count = pc.cols * 3u;
+
+    for (uint i = 0u; i < count; i++) {
+        dst_cells[base + i] = src_cells[base + i];
+    }
+
+    // Clear dirty flag.
+    dirty[row] = 0u;
+}
