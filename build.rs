@@ -33,7 +33,7 @@ fn build_lua() {
             d
         }
         None => {
-            println!("cargo:warning=──────────────────────────────────────────────");
+            println!("cargo:warning=");
             println!("cargo:warning=Lua 5.4 source not found! Tried:");
             for c in &candidates {
                 println!("cargo:warning=  {c}/lapi.c");
@@ -41,7 +41,7 @@ fn build_lua() {
             println!("cargo:warning=");
             println!("cargo:warning=Fix: clone Lua into arch/lua54/");
             println!("cargo:warning=  git clone https://github.com/lua/lua.git arch/lua54 --branch v5.4.7 --depth 1");
-            println!("cargo:warning=──────────────────────────────────────────────");
+            println!("cargo:warning=");
             return;
         }
     };
@@ -205,7 +205,7 @@ fn find_glslc() -> Option<String> {
     // 2. Check VULKAN_SDK env var.
     if let Ok(sdk) = std::env::var("VULKAN_SDK") {
         // Standard SDK layout: $VULKAN_SDK/Bin/glslc.exe (Windows)
-        //                      $VULKAN_SDK/bin/glslc     (Unix)
+        //                     $VULKAN_SDK/bin/glslc     (Unix)
         for subdir in &["Bin", "bin", "Bin32"] {
             let name = if cfg!(windows) { "glslc.exe" } else { "glslc" };
             let candidate = std::path::PathBuf::from(&sdk).join(subdir).join(name);

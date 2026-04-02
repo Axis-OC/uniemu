@@ -1,29 +1,72 @@
 #version 450
 
-/// DIRECT-mode compute shader.
+/// DIRECT-mode compose compute shader.
 ///
-/// Reads the raw cell data from a persistent SSBO (written by Lua thread)
-/// and copies it to the render-visible SSBO, respecting per-row dirty flags.
-/// This enables the task-shader culling optimisation path.
+/// This shader is dispatched once per frame in the DIRECT rendering
+/// pipeline. Its job is to selectively copy dirty rows from the
+/// CPU-writable SSBO (`src_cells`) to the GPU-readable SSBO
+/// (`dst_cells`), guided by per-row dirty flags.
+///
+/// ## Why a compute shader?
+///
+/// Without this shader, the CPU would need to upload the entire SSBO
+/// every frame (96 KiB for 160x50). With dirty-row tracking, only
+/// changed rows are written by the CPU, but the GPU still needs a
+/// complete copy in `dst_cells` for the fragment shader to read.
+///
+/// The compose shader bridges this gap: it copies only the dirty rows
+/// from `src_cells` to `dst_cells`, leaving clean rows untouched.
+/// Clean rows were inherited from the previous frame via
+/// `cmd_copy_buffer` before this dispatch.
+///
+/// ## Descriptor set layout (set 0)
+///
+/// * Binding 0: `src_cells` (STORAGE_BUFFER, readonly)
+///   - Written by the CPU (persistently mapped HOST_VISIBLE SSBO).
+///   - Contains cell data for dirty rows only.
+///
+/// * Binding 1: `dirty` (STORAGE_BUFFER, read-write)
+///   - One u32 per row: 1 = dirty, 0 = clean.
+///   - Set by the CPU, cleared by this shader after copying.
+///
+/// * Binding 2: `dst_cells` (STORAGE_BUFFER, writeonly)
+///   - Read by the fragment shader (DEVICE_LOCAL SSBO).
+///   - Contains the complete cell data for the current frame.
+///
+/// ## Push constants
+///
+/// * `cols` (u32) - Grid width in columns.
+/// * `rows` (u32) - Grid height in rows.
+///
+/// ## Dispatch
+///
+/// Dispatched as `(ceil(rows / 256), 1, 1)`.
+/// Each invocation handles one row (identified by `gl_GlobalInvocationID.x`).
+///
+/// ## Data layout
+///
+/// Each cell is 3 consecutive u32 values: [codepoint, fg, bg].
+/// A row of `cols` cells occupies `cols * 3` u32 values.
+/// Row `row` starts at offset `row * cols * 3` in both SSBOs.
 
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PushConstants {
-    uint cols;   // grid width
-    uint rows;   // grid height
+    uint cols;   // grid width in columns
+    uint rows;   // grid height in rows
 } pc;
 
-/// Source: persistently mapped, written by Lua.
+/// Source cells: written by the CPU, read by this shader.
 layout(std430, set = 0, binding = 0) readonly buffer SrcCells {
     uint src_cells[];
 };
 
-/// Per-row dirty flags (1 = needs update, 0 = clean).
+/// Per-row dirty flags: 1 = row needs copying, 0 = row is clean.
 layout(std430, set = 0, binding = 1) buffer DirtyFlags {
     uint dirty[];
 };
 
-/// Destination: read by the fragment shader.
+/// Destination cells: written by this shader, read by text.frag.
 layout(std430, set = 0, binding = 2) writeonly buffer DstCells {
     uint dst_cells[];
 };
@@ -32,9 +75,10 @@ void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= pc.rows) return;
 
-    // Only copy dirty rows.
+    // Skip clean rows (no data to copy).
     if (dirty[row] == 0u) return;
 
+    // Copy the entire row from src to dst.
     uint base = row * pc.cols * 3u;
     uint count = pc.cols * 3u;
 
@@ -42,6 +86,6 @@ void main() {
         dst_cells[base + i] = src_cells[base + i];
     }
 
-    // Clear dirty flag.
+    // Clear the dirty flag so the next frame doesn't re-copy this row.
     dirty[row] = 0u;
 }

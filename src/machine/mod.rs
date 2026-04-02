@@ -11,6 +11,7 @@
 //! hooks that a Lua host calls into.
 
 pub mod signal;
+pub mod persistence;
 
 use std::collections::HashMap;
 use signal::{Signal, SignalQueue};
@@ -64,22 +65,22 @@ pub struct Machine {
     /// Emulation mode for GPU calls.
     pub mode: EmulationMode,
 
-    // ── Components ──────────────────────────────────────────────────────
+    // Components 
     /// `address → component_type_name` (e.g. `"gpu"`, `"filesystem"`).
     components: HashMap<String, String>,
     /// Maximum number of components this machine supports (CPU-dependent).
     pub max_components: usize,
 
-    // ── Signals ─────────────────────────────────────────────────────────
+    // Signals 
     signals: SignalQueue,
 
-    // ── Call budget ─────────────────────────────────────────────────────
+    // Call budget 
     /// Budget remaining for direct calls this tick.
     call_budget: f64,
     /// Maximum budget per tick (derived from CPU + memory tiers).
     max_call_budget: f64,
 
-    // ── Timing ──────────────────────────────────────────────────────────
+    // Timing 
     /// Ticks since the machine started (for `computer.uptime()`).
     uptime_ticks: u64,
     /// Ticks remaining to sleep before auto-resume.
@@ -87,7 +88,7 @@ pub struct Machine {
     /// Ticks remaining in an explicit pause.
     remain_pause: u32,
 
-    // ── Energy ──────────────────────────────────────────────────────────
+    // Energy 
     /// Local energy buffer.
     energy: f64,
     /// Maximum energy buffer size.
@@ -120,7 +121,7 @@ impl Machine {
         }
     }
 
-    // ── State queries ───────────────────────────────────────────────────
+    // State queries 
 
     #[inline] pub fn state(&self) -> State { self.state }
 
@@ -134,7 +135,7 @@ impl Machine {
         self.state == State::Paused && self.remain_pause > 0
     }
 
-    // ── Lifecycle ───────────────────────────────────────────────────────
+    // Lifecycle 
 
     /// Attempt to start the machine. Returns `true` if state changed.
     ///
@@ -143,13 +144,17 @@ impl Machine {
         match self.state {
             State::Stopped => {
                 if !self.config.ignore_power && self.energy < self.cost_per_tick {
-                    return false; // no energy
+                    log::warn!("Machine start failed: not enough energy ({:.1}/{:.1})",
+                        self.energy, self.cost_per_tick);
+                    return false;
                 }
                 if self.max_components == 0 {
-                    return false; // no CPU
+                    log::warn!("Machine start failed: no CPU (max_components=0)");
+                    return false;
                 }
                 self.state = State::Starting;
                 self.uptime_ticks = 0;
+                log::info!("Machine starting (mode={:?})", self.mode);
                 true
             }
             State::Paused if self.remain_pause > 0 => {
@@ -169,6 +174,7 @@ impl Machine {
         match self.state {
             State::Stopped | State::Stopping => false,
             _ => {
+                log::info!("Machine stopping (was {:?})", self.state);
                 self.state = State::Stopping;
                 true
             }
@@ -192,11 +198,13 @@ impl Machine {
     }
 
     /// Crash with an error message.  Triggers a stop.
-    pub fn crash(&mut self, _message: &str) -> bool {
+    pub fn crash(&mut self, message: &str) -> bool {
+        log::error!("Machine crash: {message}");
         self.stop()
     }
 
-    // ── Per-tick update ─────────────────────────────────────────────────
+
+    // Per-tick update 
 
     /// Called once per server tick (50 ms in Minecraft).
     ///
@@ -212,7 +220,7 @@ impl Machine {
 
         // Reset call budget every tick.
         self.call_budget = self.max_call_budget;
-
+        let old_state = self.state;
         // Energy consumption.
         if !self.config.ignore_power {
             let cost = match self.state {
@@ -228,6 +236,8 @@ impl Machine {
                 return;
             }
         }
+        self.call_budget = self.max_call_budget;
+        crate::profiler::budget(1.0); 
 
         // State transitions.
         match self.state {
@@ -247,80 +257,37 @@ impl Machine {
             }
             _ => {}
         }
-    }
-
-        pub fn step_lua(
-        &mut self,
-        lua: &crate::lua::state::LuaState,
-        ctx: &mut crate::lua::host::HostContext,
-    ) -> Option<crate::lua::host::ExecResult> {
-        if !self.is_running() || self.state == State::Sleeping {
-            return None;
-        }
-        if self.state == State::Paused {
-            return None;
-        }
-
-        // Update host context.
-        ctx.uptime = self.uptime();
-        ctx.world_time = self.uptime_ticks;
-
-        // Check if we have a signal to deliver.
-        let signal_args = if let Some(sig) = self.pop_signal() {
-            push_signal_to_lua(lua, &sig);
-            1 + sig.args.len() as i32
-        } else {
-            0
-        };
-
-        self.state = State::Running;
-        let result = crate::lua::host::step_kernel(lua, signal_args);
         
-        // Transition state based on result.
-        match &result {
-            crate::lua::host::ExecResult::Sleep(secs) => {
-                self.state = State::Sleeping;
-                self.remain_idle = (*secs * 20.0).max(0.0) as u32;
-            }
-            crate::lua::host::ExecResult::Shutdown { reboot } => {
-                if *reboot {
-                    self.state = State::Restarting;
-                } else {
-                    self.state = State::Stopping;
-                }
-            }
-            crate::lua::host::ExecResult::Halted => {
-                self.state = State::Stopped;
-            }
-            crate::lua::host::ExecResult::Error(_) => {
-                self.state = State::Stopped;
-            }
-            crate::lua::host::ExecResult::SynchronizedCall => {
-                self.state = State::SynchronizedCall;
-            }
+        if self.state != old_state {
+            log::debug!("Machine state: {:?} -> {:?}", old_state, self.state);
         }
-
-        Some(result)
     }
 
-    // ── Signal API ──────────────────────────────────────────────────────
+    // Signal API 
 
     /// Push a signal into the queue.  Returns `false` if the queue is full.
     ///
     /// Mirrors `Machine.signal()` from `Machine.scala`.
     pub fn push_signal(&mut self, signal: Signal) -> bool {
         if matches!(self.state, State::Stopped | State::Stopping) {
+            log::trace!("Signal '{}' dropped (machine {:?})", signal.name, self.state);
             return false;
         }
-        self.signals.push(signal)
+        let ok = self.signals.push(signal.clone());
+        if !ok {
+            log::warn!("Signal queue full, dropping '{}' (len={})",
+                signal.name, self.signals.len());
+        } else {
+            log::trace!("Signal '{}' queued (len={})", signal.name, self.signals.len());
+        }
+        ok
     }
-
     /// Pop the next signal (FIFO).  Returns `None` if queue is empty.
     pub fn pop_signal(&mut self) -> Option<Signal> {
         self.signals.pop()
     }
 
-    // ── Call budget ─────────────────────────────────────────────────────
+    // Call budget 
 
     /// Consume call budget for a direct call.
     ///
@@ -334,9 +301,16 @@ impl Machine {
         }
         let clamped = cost.max(0.0);
         if clamped > self.call_budget {
+            crate::profiler::budget(0.0);
             return Err(());
         }
         self.call_budget -= clamped;
+
+        let pct = if self.max_call_budget > 0.0 {
+            (self.call_budget / self.max_call_budget) as f32
+        } else { 1.0 };
+        crate::profiler::budget(pct);
+
         Ok(())
     }
 
@@ -346,7 +320,7 @@ impl Machine {
         self.mode == EmulationMode::Direct
     }
 
-    // ── Components ──────────────────────────────────────────────────────
+    // Components 
 
     /// Register a component.  Queues `component_added` signal if running.
     pub fn add_component(&mut self, address: String, type_name: String) {
@@ -354,8 +328,10 @@ impl Machine {
             self.push_signal(Signal::new("component_added")
                 .with_string(address.clone())
                 .with_string(type_name.clone()));
+            log::info!("Component added: {type_name} -> {}...", &address[..8.min(address.len())]);
         }
         self.components.insert(address, type_name);
+        
     }
 
     /// Remove a component.  Queues `component_removed` signal if running.
@@ -381,26 +357,3 @@ impl Machine {
     }
 }
 
-fn push_signal_to_lua(
-    lua: &crate::lua::state::LuaState,
-    signal: &crate::machine::signal::Signal,
-) {
-    let thread = match lua.get_thread(1) {
-        Some(t) => t,
-        None => return, // no thread / silently skip
-    };
-
-    thread.push_string(&signal.name);
-    for arg in &signal.args {
-        use crate::machine::signal::SignalArg;
-        match arg {
-            SignalArg::Nil => thread.push_nil(),
-            SignalArg::Bool(b) => thread.push_bool(*b),
-            SignalArg::Int(n) => thread.push_integer(*n),
-            SignalArg::Float(n) => thread.push_number(*n),
-            SignalArg::Str(s) => thread.push_string(s),
-            SignalArg::Bytes(b) => thread.push_bytes(b),
-        }
-    }
-    // thread is non-owning, drop is safe (no lua_close called).
-}
